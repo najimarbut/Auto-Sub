@@ -25,7 +25,7 @@ import yaml
 from logger import logger
 
 import subconverter
-from clash import is_meta, verify
+from clash import is_mihomo, verify
 
 EMAILS_DOMAINS = [
     "gmail.com",
@@ -44,6 +44,9 @@ PATH = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 
 # 重命名分隔符
 RENAME_SEPARATOR = "#@&#@"
+
+# 重命名正则表达式组分隔符
+RENAME_GROUP_SEPARATOR = "`"
 
 # 生成随机字符串时候选字符
 LETTERS = set(string.ascii_letters + string.digits)
@@ -224,7 +227,9 @@ class AirPort:
         except:
             return self.sen_email_verify(email=email, retry=retry - 1)
 
-    def register(self, email: str, password: str, email_code: str = None, retry: int = 3) -> tuple[str, str]:
+    def register(
+        self, email: str, password: str, email_code: str = None, invite_code: str = None, retry: int = 3
+    ) -> tuple[str, str]:
         if retry <= 0:
             logger.info(f"achieved max retry when register, domain: {self.ref}")
             return "", ""
@@ -235,7 +240,7 @@ class AirPort:
         params = {
             "email": email,
             "password": password,
-            "invite_code": "",
+            "invite_code": utils.trim(invite_code),
             "email_code": utils.trim(email_code),
         }
 
@@ -282,7 +287,7 @@ class AirPort:
 
             return cookies, authorization
         except:
-            return self.register(email, password, email_code, retry - 1)
+            return self.register(email, password, email_code, invite_code, retry - 1)
 
     def order_plan(
         self,
@@ -356,16 +361,17 @@ class AirPort:
             return []
 
     def get_subscribe(
-        self, retry: int, rr: RegisterRequire = None, rigid: bool = True, chuck: bool = False
+        self, retry: int, rr: RegisterRequire = None, rigid: bool = True, chuck: bool = False, invite_code: str = None
     ) -> tuple[str, str]:
         if self.registed:
             return "", ""
 
+        invite_code = utils.trim(invite_code)
         rr = rr if rr is not None else self.get_register_require(domain=self.ref, default=False)
 
         # 需要邀请码或者强制验证
         if (
-            rr.invite
+            (rr.invite and not invite_code)
             or (chuck and rr.recaptcha)
             or (rr.whitelist and rr.verify and (rigid or "gmail.com" not in rr.whitelist))
         ):
@@ -382,7 +388,7 @@ class AirPort:
                 return "", ""
 
             email = f"{email}@{email_domain}"
-            return self.register(email=email, password=password, retry=retry)
+            return self.register(email=email, password=password, invite_code=invite_code, retry=retry)
         else:
             onlygmail = True if rr.whitelist and rr.verify else False
 
@@ -423,6 +429,7 @@ class AirPort:
                     email=account.address,
                     password=account.password,
                     email_code=mask,
+                    invite_code=invite_code,
                     retry=retry,
                 )
             except:
@@ -436,13 +443,11 @@ class AirPort:
         rate: float,
         bin_name: str,
         tag: str,
-        allow_insecure: bool = False,
+        disable_insecure: bool = False,
         udp: bool = True,
         ignore_exclude: bool = False,
         chatgpt: dict = None,
         special_protocols: bool = False,
-        emoji_patterns: dict = None,
-        remained: bool = False,
     ) -> list:
         if "" == self.sub:
             logger.error(f"[ParseError] cannot found any proxies because subscribe url is empty, domain: {self.ref}")
@@ -513,15 +518,21 @@ class AirPort:
 
                 try:
                     if self.rename:
-                        # re对group的引用方法: https://stackoverflow.com/questions/7191209/re-sub-replace-with-matched-content
-                        if RENAME_SEPARATOR in self.rename:
-                            words = self.rename.split(RENAME_SEPARATOR, maxsplit=1)
-                            old = words[0].strip()
-                            new = words[1].strip()
-                            if old:
-                                name = re.sub(old, new, name, flags=re.I)
-                        else:
-                            name = re.sub(self.rename, "", name, flags=re.I)
+                        pattern_groups = self.rename.split(RENAME_GROUP_SEPARATOR)
+                        for group in pattern_groups:
+                            rename_regex = utils.trim(group)
+                            if not rename_regex:
+                                continue
+
+                            # re对group的引用方法: https://stackoverflow.com/questions/7191209/re-sub-replace-with-matched-content
+                            if RENAME_SEPARATOR in rename_regex:
+                                words = rename_regex.split(RENAME_SEPARATOR, maxsplit=1)
+                                old = words[0].strip()
+                                new = words[1].strip()
+                                if old:
+                                    name = re.sub(old, new, name, flags=re.I)
+                            else:
+                                name = re.sub(rename_regex, "", name, flags=re.I)
 
                     # 标记需要进行ChatGPT连通性测试的节点
                     flag, detect = (
@@ -548,11 +559,6 @@ class AirPort:
                     logger.error(
                         f"rename error, name: {name},\trename: {self.rename}\tseparator: {RENAME_SEPARATOR}\tchatgpt: {pattern}\tdomain: {self.ref}"
                     )
-
-                # 是否添加 emoji
-                indexers = emoji_patterns
-                if remained and not re.search(r"^[\U0001F1E6-\U0001F1FF]{2}", name):
-                    indexers = None
 
                 name = re.sub(
                     r"\[[^\[]*\]|[（\(][^（\(]*[\)）]|{[^{]*}|<[^<]*>|【[^【]*】|「[^「]*」|[^a-zA-Z0-9\u4e00-\u9fa5_×\.\-|\s]",
@@ -581,11 +587,8 @@ class AirPort:
 
                     name = f"{name[:i].strip()}-{abbreviation}-{name[-j:].strip()}"
 
-                if indexers:
-                    emoji = utils.get_emoji(text=name, patterns=indexers, default="🇺🇸")
-                    name = f"{emoji} {name}" if emoji else name
-
-                item["name"] = name.upper()
+                name = re.sub(r"\s+(\d+)[\s_\-\|]+([A-Za-z])\b", r"-\1\2", name)
+                item["name"] = re.sub(r"(-\d+[A-Za-z])+$", "", name).upper()
 
                 if "" != tag.strip():
                     item["name"] = tag.strip().upper() + "-" + item["name"]
@@ -594,8 +597,11 @@ class AirPort:
                 item["sub"] = self.sub
                 item["liveness"] = self.liveness
 
-                if allow_insecure:
-                    item["skip-cert-verify"] = allow_insecure
+                if disable_insecure:
+                    if "skip-cert-verify" in item:
+                        item["skip-cert-verify"] = False
+                    if "tls" in item:
+                        item["tls"] = True
 
                 if udp and "udp" not in item:
                     item["udp"] = True
@@ -688,7 +694,7 @@ class AirPort:
                     reader.seek(0, 0)
                     yaml.add_multi_constructor(
                         "str",
-                        lambda loader, suffix, node: None,
+                        lambda loader, suffix, node: str(node.value),
                         Loader=yaml.SafeLoader,
                     )
                     config = yaml.load(reader, Loader=yaml.SafeLoader)
@@ -710,7 +716,7 @@ class AirPort:
                 text = clean_text(document=text)
                 nodes = yaml.load(text, Loader=yaml.SafeLoader).get("proxies", [])
             except yaml.constructor.ConstructorError:
-                yaml.add_multi_constructor("str", lambda loader, suffix, node: None, Loader=yaml.SafeLoader)
+                yaml.add_multi_constructor("str", lambda loader, suffix, node: str(node.value), Loader=yaml.SafeLoader)
                 nodes = yaml.load(text, Loader=yaml.FullLoader).get("proxies", [])
             except Exception as e:
                 if throw:
@@ -722,4 +728,5 @@ class AirPort:
 
     @staticmethod
     def enable_special_protocols() -> bool:
-        return os.environ.get("ENABLE_SPECIAL_PROTOCOLS", "true").lower() in ["true", "1"] and is_meta()
+        flag = utils.trim(os.environ.get("ENABLE_SPECIAL_PROTOCOLS", "true")).lower()
+        return (flag == "" or flag in ["true", "1"]) and is_mihomo()
